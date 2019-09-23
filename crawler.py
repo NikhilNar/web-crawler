@@ -45,7 +45,7 @@ class Crawler:
         self.totalUrls = 0
         self.totalLogsCalls = 0
 
-    def addUrlsToCrawl(self, urls, newUrlsFlag):
+    def addUrlsToCrawl(self, urls, newUrlsFlag, depth):
         for url in urls:
             if url not in self.visitedUrlMap:
                 self.visitedUrlMap[url] = 1
@@ -67,7 +67,7 @@ class Crawler:
 
                 if newUrlsFlag is False or self.totalUrls <= self.maxLinks:
                     self.priorityQueue.put(
-                        (self.calculateScore(url) * -1, (url, datetime.now())))
+                        (self.calculateScore(url) * -1, (url, datetime.now(), depth)))
 
     def normalizeUrl(self, base_url, link):
         base_url = urljoin(base_url, '/')
@@ -106,7 +106,8 @@ class Crawler:
                 self.lock.acquire()
                 url = ""
                 while True:
-                    score, (newUrl, timeStamp) = self.priorityQueue.get_nowait()
+                    score, (newUrl, timeStamp,
+                            depth) = self.priorityQueue.get_nowait()
                     parsedUrl = urlparse(newUrl)
                     domain = parsedUrl.netloc
                     baseUrl = parsedUrl.scheme + '://' + domain
@@ -114,27 +115,27 @@ class Crawler:
                         break
 
                     del self.visitedUrlMap[newUrl]
-                    self.addUrlsToCrawl([newUrl], False)
+                    self.addUrlsToCrawl([newUrl], False, depth)
                     url = newUrl
-
-                row = [newUrl, '10', '1', score*-1, datetime.now().strftime(
-                    "%d-%m-%Y %H:%M:%S"), threading.currentThread().getName()]
                 self.lock.release()
-                log.writeLog(row)
-                self.totalLogsCalls += 1
-
-                if self.totalUrls > self.maxLinks:
+                if self.totalLogsCalls > self.maxLinks:
                     continue
                 try:
-                    page = urlopen(newUrl)
+                    page = urlopen(newUrl, timeout=4)
                     mimeType = page.info().get_content_maintype()
                     if mimeType != 'text' or page.getcode() != 200:
                         continue
                     htmlContent = page.read().decode('utf8')
+                    pageSize = len(htmlContent)
                 except Exception as e:
                     print("Exception occured during opening a page =", e)
                     print("url after exception ===", newUrl)
                     continue
+
+                row = [newUrl, pageSize, depth, score*-1, datetime.now().strftime(
+                    "%d-%m-%Y %H:%M:%S"), threading.currentThread().getName()]
+                log.writeLog(row)
+                self.totalLogsCalls += 1
 
                 soup = BeautifulSoup(htmlContent, 'html.parser')
                 newUrls = []
@@ -150,7 +151,7 @@ class Crawler:
                     except:
                         continue
                 self.lock.acquire()
-                self.addUrlsToCrawl(newUrls, True)
+                self.addUrlsToCrawl(newUrls, True, depth + 1)
                 self.lock.release()
         except Exception as e:
             print("Exception occured =", e)
@@ -159,10 +160,10 @@ class Crawler:
 
 
 if __name__ == '__main__':
-    searchResults = search("rubique", stop=10)
+    searchResults = search("amazon web services", stop=10)
     crawler = Crawler(990)
     log = Log()
-    crawler.addUrlsToCrawl(searchResults, False)
+    crawler.addUrlsToCrawl(searchResults, False, 0)
 
     threads = []
     start = datetime.now()
