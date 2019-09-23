@@ -16,6 +16,7 @@ class Log:
                        'score', 'time_of_crawl', 'thread_name']
         self.lock = threading.Lock()
         self.logFileWriter, self.logFile = self.createLog()
+        self.totalLogWrites = 0
 
     def createLog(self):
         logFile = open(self.fileName, 'w', newline='')
@@ -24,6 +25,7 @@ class Log:
         return filewriter, logFile
 
     def writeLog(self, row):
+        self.totalLogWrites += 1
         self.lock.acquire()
         self.logFileWriter.writerow(row)
         self.lock.release()
@@ -38,25 +40,36 @@ class Crawler:
         self.priorityQueue = PriorityQueue()
         self.visitedUrlMap = {}
         self.visitedDomainsNoveltyScore = {}
+        self.importanceScore = {}
         self.lock = threading.Lock()
         self.totalUrls = 0
+        self.totalLogsCalls = 0
 
-    def addUrlsToCrawl(self, urls):
-        self.lock.acquire()
+    def addUrlsToCrawl(self, urls, newUrlsFlag):
         for url in urls:
             if url not in self.visitedUrlMap:
                 self.visitedUrlMap[url] = 1
-                self.totalUrls += 1
-                if self.totalUrls <= self.maxLinks:
-                    self.priorityQueue.put((-1, url))
+                if newUrlsFlag:
+                    self.totalUrls += 1
+                    parsedUrl = urlparse(url)
+                    domain = parsedUrl.netloc
+                    if domain not in self.visitedDomainsNoveltyScore:
+                        self.visitedDomainsNoveltyScore[domain] = (
+                            100, datetime.now())
+                    else:
+                        noveltyScore = self.visitedDomainsNoveltyScore[domain][0]
+                        self.visitedDomainsNoveltyScore[domain] = (
+                            noveltyScore - 5, datetime.now())
+                    if url not in self.importanceScore:
+                        self.importanceScore[url] = 10
+                    else:
+                        self.importanceScore[url] += 10
 
-        print("priority queue size after insert =====",
-              self.priorityQueue.qsize())
-        self.lock.release()
+                if newUrlsFlag is False or self.totalUrls <= self.maxLinks:
+                    self.priorityQueue.put(
+                        (self.calculateScore(url) * -1, (url, datetime.now())))
 
     def normalizeUrl(self, base_url, link):
-        print("base_url =", base_url)
-        print("link =", link)
         base_url = urljoin(base_url, '/')
         if link is None or link == '#' or link.startswith('#'):
             return None
@@ -66,45 +79,61 @@ class Crawler:
             return 'http' + link
         if link.startswith('/'):
             return base_url[:-1] + link if base_url[-1] == '/' else base_url + link
-        else:
-            return base_url + link
+
         return link
+
+    def calculateScore(self, url):
+        noveltyScore = 100
+        importanceScore = 0
+        parsedUrl = urlparse(url)
+        domain = parsedUrl.netloc
+        if domain in self.visitedDomainsNoveltyScore:
+            noveltyScore = self.visitedDomainsNoveltyScore[domain][0]
+        else:
+            self.visitedDomainsNoveltyScore[domain] = (100, datetime.now())
+
+        if url in self.importanceScore:
+            importanceScore = self.importanceScore[url]
+        else:
+            importanceScore = 10
+            self.importanceScore[url] = 10
+
+        return 0.5 * noveltyScore + importanceScore
 
     def crawlWeb(self, log):
         try:
             while not self.priorityQueue.empty():
-                print("self.totalUrls =", self.totalUrls)
-                print("self.maxLinks =", self.maxLinks)
                 self.lock.acquire()
-                score, url = self.priorityQueue.get_nowait()
-                print(threading.currentThread().getName())
-                print(url)
-                row = [url, '10', '1', score, datetime.now().strftime(
+                url = ""
+                while True:
+                    score, (newUrl, timeStamp) = self.priorityQueue.get_nowait()
+                    parsedUrl = urlparse(newUrl)
+                    domain = parsedUrl.netloc
+                    baseUrl = parsedUrl.scheme + '://' + domain
+                    if newUrl == url or timeStamp > self.visitedDomainsNoveltyScore[domain][1]:
+                        break
+
+                    del self.visitedUrlMap[newUrl]
+                    self.addUrlsToCrawl([newUrl], False)
+                    url = newUrl
+
+                row = [newUrl, '10', '1', score*-1, datetime.now().strftime(
                     "%d-%m-%Y %H:%M:%S"), threading.currentThread().getName()]
-
-                parsedUrl = urlparse(url)
-                domain = parsedUrl.netloc
-                baseUrl = parsedUrl.scheme + '://' + domain
-
-                print("domain =", domain)
-
-                if domain in self.visitedDomainsNoveltyScore:
-                    self.visitedDomainsNoveltyScore[domain] -= 1
-                else:
-                    self.visitedDomainsNoveltyScore[domain] = 100
                 self.lock.release()
                 log.writeLog(row)
+                self.totalLogsCalls += 1
 
                 if self.totalUrls > self.maxLinks:
                     continue
                 try:
-                    page = urlopen(url)
+                    page = urlopen(newUrl)
                     mimeType = page.info().get_content_maintype()
                     if mimeType != 'text' or page.getcode() != 200:
                         continue
                     htmlContent = page.read().decode('utf8')
                 except Exception as e:
                     print("Exception occured during opening a page =", e)
+                    print("url after exception ===", newUrl)
                     continue
 
                 soup = BeautifulSoup(htmlContent, 'html.parser')
@@ -113,14 +142,16 @@ class Crawler:
                     if self.totalUrls > self.maxLinks:
                         break
                     try:
-                        print("a['href'] =", a['href'])
                         fullUrl = self.normalizeUrl(baseUrl, a['href'])
-                        print("fullUrl =", fullUrl)
-                        if fullUrl not in self.visitedUrlMap and fullUrl is not None:
-                            newUrls.append(fullUrl)
+
+                        if fullUrl is not None:
+                            if fullUrl not in self.visitedUrlMap:
+                                newUrls.append(fullUrl)
                     except:
                         continue
-                self.addUrlsToCrawl(newUrls)
+                self.lock.acquire()
+                self.addUrlsToCrawl(newUrls, True)
+                self.lock.release()
         except Exception as e:
             print("Exception occured =", e)
             self.lock.release()
@@ -128,10 +159,10 @@ class Crawler:
 
 
 if __name__ == '__main__':
-    searchResults = search("amazon web services", stop=10)
-    crawler = Crawler(1000)
+    searchResults = search("rubique", stop=10)
+    crawler = Crawler(990)
     log = Log()
-    crawler.addUrlsToCrawl(searchResults)
+    crawler.addUrlsToCrawl(searchResults, False)
 
     threads = []
     start = datetime.now()
@@ -148,3 +179,5 @@ if __name__ == '__main__':
     print("total time =", datetime.now() - start)
     print("totalUrls =", crawler.totalUrls)
     print("priorityQueue size =", crawler.priorityQueue.qsize())
+    print("totalLogWrites calls ===", log.totalLogWrites,
+          " self.totalLogsCalls ====", crawler.totalLogsCalls)
