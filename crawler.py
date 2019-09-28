@@ -3,6 +3,7 @@ from queue import PriorityQueue
 from datetime import date, datetime
 from urllib.parse import urlparse, urljoin
 from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
 from bs4 import BeautifulSoup
 import threading
 import csv
@@ -13,10 +14,11 @@ class Log:
         self.fileName = "crawl_log_" + \
             str(date.today().strftime("%d-%m-%Y"))+".csv"
         self.fields = ['url', 'size', 'depth',
-                       'score', 'time_of_crawl', 'thread_name']
+                       'score', 'status_code', 'time_of_crawl', 'thread_name']
         self.lock = threading.Lock()
         self.logFileWriter, self.logFile = self.createLog()
         self.totalLogWrites = 0
+        self.totalLogWriteErrors = 0
 
     def createLog(self):
         logFile = open(self.fileName, 'w', newline='')
@@ -24,10 +26,20 @@ class Log:
         filewriter.writerow(self.fields)
         return filewriter, logFile
 
-    def writeLog(self, row):
-        self.totalLogWrites += 1
+    def writeLog(self, row, maxWrites):
         self.lock.acquire()
-        self.logFileWriter.writerow(row)
+        try:
+            if self.totalLogWrites >= 1000:
+                self.lock.release()
+                return
+            self.logFileWriter.writerow(row)
+            self.totalLogWrites += 1
+        except Exception as e:
+            print("error occured in writing logs =====", e)
+            self.totalLogWriteErrors += 1
+            self.lock.release()
+            return
+
         self.lock.release()
 
     def closeLog(self):
@@ -45,11 +57,13 @@ class Crawler:
         self.totalUrls = 0
         self.totalLogsCalls = 0
 
-    def addUrlsToCrawl(self, urls, newUrlsFlag, depth):
+    def addUrlsToCrawl(self, urls, newUrlsFlag, depth, log):
         for url in urls:
             if url not in self.visitedUrlMap:
                 self.visitedUrlMap[url] = 1
                 if newUrlsFlag:
+                    if self.totalUrls >= self.maxLinks:
+                        return
                     self.totalUrls += 1
                     parsedUrl = urlparse(url)
                     domain = parsedUrl.netloc
@@ -68,6 +82,7 @@ class Crawler:
                 if newUrlsFlag is False or self.totalUrls <= self.maxLinks:
                     self.priorityQueue.put(
                         (self.calculateScore(url) * -1, (url, datetime.now(), depth)))
+        print("self.priorityQueue size ===", self.priorityQueue.qsize())
 
     def normalizeUrl(self, base_url, link):
         base_url = urljoin(base_url, '/')
@@ -104,54 +119,92 @@ class Crawler:
         try:
             while not self.priorityQueue.empty():
                 self.lock.acquire()
+                if log.totalLogWrites >= self.maxLinks + 10:
+                    self.lock.release()
+                    break
+
                 url = ""
+                count = 0
                 while True:
                     score, (newUrl, timeStamp,
                             depth) = self.priorityQueue.get_nowait()
+
+                    count += 1
                     parsedUrl = urlparse(newUrl)
                     domain = parsedUrl.netloc
                     baseUrl = parsedUrl.scheme + '://' + domain
-                    if newUrl == url or timeStamp > self.visitedDomainsNoveltyScore[domain][1]:
+                    if newUrl == url or timeStamp >= self.visitedDomainsNoveltyScore[domain][1]:
                         break
 
+                    print("count =============", count)
+
                     del self.visitedUrlMap[newUrl]
-                    self.addUrlsToCrawl([newUrl], False, depth)
+                    self.addUrlsToCrawl([newUrl], False, depth, log)
                     url = newUrl
+
                 self.lock.release()
-                if self.totalLogsCalls > self.maxLinks:
-                    continue
                 try:
                     page = urlopen(newUrl, timeout=4)
                     mimeType = page.info().get_content_maintype()
-                    if mimeType != 'text' or page.getcode() != 200:
+                    statusCode = page.getcode()
+
+                    if statusCode == 200:
+                        htmlContent = page.read().decode('utf8')
+                        pageSize = len(htmlContent)
+                    else:
+                        pageSize = 0
+
+                    row = [newUrl, pageSize, depth, score*-1, statusCode, datetime.now().strftime(
+                        "%d-%m-%Y %H:%M:%S"), threading.currentThread().getName()]
+                    log.writeLog(row, self.maxLinks + 10)
+
+                    if mimeType != 'text' or statusCode != 200:
                         continue
-                    htmlContent = page.read().decode('utf8')
-                    pageSize = len(htmlContent)
-                except Exception as e:
+
+                except HTTPError as e:
                     print("Exception occured during opening a page =", e)
                     print("url after exception ===", newUrl)
+
+                    statusCode = e.code
+                    print(" statusCode  after exception ===",  statusCode)
+                    row = [newUrl, 0, depth, score*-1, statusCode, datetime.now().strftime(
+                        "%d-%m-%Y %H:%M:%S"), threading.currentThread().getName()]
+                    log.writeLog(row, self.maxLinks + 10)
+                    continue
+                except URLError as e:
+                    print("URL ERROR OCCURRED ========")
+                    row = [newUrl, 0, depth, score*-1, -1, datetime.now().strftime(
+                        "%d-%m-%Y %H:%M:%S"), threading.currentThread().getName()]
+                    log.writeLog(row, self.maxLinks + 10)
+                    continue
+                except Exception as e:
+                    print("Exception OCCURRED ========")
+                    row = [newUrl, 0, depth, score*-1, -1, datetime.now().strftime(
+                        "%d-%m-%Y %H:%M:%S"), threading.currentThread().getName()]
+                    log.writeLog(row, self.maxLinks + 10)
                     continue
 
-                row = [newUrl, pageSize, depth, score*-1, datetime.now().strftime(
-                    "%d-%m-%Y %H:%M:%S"), threading.currentThread().getName()]
-                log.writeLog(row)
-                self.totalLogsCalls += 1
+                self.lock.acquire()
+                if self.totalUrls >= 990:
+                    self.lock.release()
+                    continue
+                self.lock.release()
 
                 soup = BeautifulSoup(htmlContent, 'html.parser')
                 newUrls = []
-                for a in soup("a"):
-                    if self.totalUrls > self.maxLinks:
-                        break
+                anchorTags = soup("a")
+                print("anchorTags =====", len(anchorTags))
+                for a in anchorTags:
                     try:
                         fullUrl = self.normalizeUrl(baseUrl, a['href'])
-
                         if fullUrl is not None:
                             if fullUrl not in self.visitedUrlMap:
                                 newUrls.append(fullUrl)
                     except:
                         continue
+
                 self.lock.acquire()
-                self.addUrlsToCrawl(newUrls, True, depth + 1)
+                self.addUrlsToCrawl(newUrls, True, depth + 1, log)
                 self.lock.release()
         except Exception as e:
             print("Exception occured =", e)
@@ -163,7 +216,7 @@ if __name__ == '__main__':
     searchResults = search("amazon web services", stop=10)
     crawler = Crawler(990)
     log = Log()
-    crawler.addUrlsToCrawl(searchResults, False, 0)
+    crawler.addUrlsToCrawl(searchResults, False, 0, log)
 
     threads = []
     start = datetime.now()
@@ -182,3 +235,4 @@ if __name__ == '__main__':
     print("priorityQueue size =", crawler.priorityQueue.qsize())
     print("totalLogWrites calls ===", log.totalLogWrites,
           " self.totalLogsCalls ====", crawler.totalLogsCalls)
+    print("totalLogWritesErrors =====", log.totalLogWriteErrors)
