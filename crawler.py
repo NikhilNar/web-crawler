@@ -18,7 +18,10 @@ class Log:
                        'score', 'status_code', 'time_of_crawl', 'allowed_to_crawl', 'thread_name']
         self.lock = threading.Lock()
         self.logFileWriter, self.logFile = self.createLog()
+        # stores the number of writes into the csv file
         self.totalLogWrites = 0
+
+        # used to maintain the total number of errors while writing the logs
         self.totalLogWriteErrors = 0
 
     def createLog(self):
@@ -49,34 +52,57 @@ class Log:
 
 
 class Crawler:
-    def __init__(self, maxLinks):
-        self.maxLinks = maxLinks
-        self.priorityQueue = PriorityQueue()
-        self.visitedUrlMap = {}
-        self.robotAllowed = {}
-        self.visitedDomainsNoveltyScore = {}
-        self.importanceScore = {}
-        self.totalUrlsParsed = 0
-        self.lock = threading.Lock()
-        self.totalUrls = 0
-        self.totalLogsCalls = 0
+    def __init__(self, maxUrls):
+        # maximum URLs that should be parsed
+        self.maxUrls = maxUrls
 
+        # stores a url with novelty and importance score
+        self.priorityQueue = PriorityQueue()
+
+        # stores visited urls
+        self.visitedUrlMap = {}
+
+        # stores the information if the url is allowed to parse based on robots.txt file
+        self.robotAllowed = {}
+
+        # stores the novelty score for the domain
+        self.visitedDomainsNoveltyScore = {}
+
+        # stores the importance score for the domain
+        self.importanceScore = {}
+
+        # stores the number of URLs parsed in different pages
+        self.totalUrlsParsed = 0
+
+        self.lock = threading.Lock()
+
+        # stores all the URLs that are added to the priority queue
+        self.totalUrls = 0
+
+        # stores the count of the URLs that are visited again
+        self.totalDuplicatedUrls = 0
+
+    # adds URLs to priority queue
+    # newUrlsFlag will be True if the url is not visited before else False
+    # newUrlsFlag is False when the same url is added to the priority queue after
+    # updating the novelty score
     def addUrlsToCrawl(self, urls, newUrlsFlag, depth, log):
         try:
             for (url, robotAllowed) in urls:
                 if url not in self.visitedUrlMap:
                     self.visitedUrlMap[url] = 1
                     if newUrlsFlag:
-                        if self.totalUrls >= self.maxLinks:
+                        if self.totalUrls >= self.maxUrls:
                             return
                         self.totalUrls += 1
-                        print("self.totalUrls ===============", self.totalUrls)
+                        print("total new URLs =", self.totalUrls)
                         parsedUrl = urlparse(url)
                         domain = parsedUrl.netloc
                         if domain not in self.visitedDomainsNoveltyScore:
                             self.visitedDomainsNoveltyScore[domain] = (
                                 100, datetime.now())
                         else:
+                            # decrease novelty score if the url of the same domain is visited again
                             noveltyScore = self.visitedDomainsNoveltyScore[domain][0]
                             self.visitedDomainsNoveltyScore[domain] = (
                                 noveltyScore - 5, datetime.now())
@@ -85,16 +111,20 @@ class Crawler:
                         else:
                             self.importanceScore[url] += 10
 
-                    if newUrlsFlag is False or self.totalUrls <= self.maxLinks:
+                    if newUrlsFlag is False or self.totalUrls <= self.maxUrls:
                         self.priorityQueue.put(
                             (self.calculateScore(url) * -1, (url, datetime.now(), depth, robotAllowed)))
                 else:
+                    # decrease the totalUrlsParsed variable as we need more URLs to get total
+                    # maxLinks
                     self.totalUrlsParsed -= 1
-                    print("same URL occured==========")
-        except:
-            print("exception occured while adding URLs")
-        print("self.priorityQueue size ===", self.priorityQueue.qsize())
+                    self.totalDuplicatedUrls += 1
+                    print("URL already visited =", url)
+        except Exception as e:
+            print("exception occured while adding URLs = ", e)
+        print("priority queue size = ", self.priorityQueue.qsize())
 
+    # normalize URL such that every URL has a domain present in the URL
     def normalizeUrl(self, base_url, link):
         base_url = urljoin(base_url, '/')
         if link is None or link == '#' or link.startswith('#'):
@@ -108,6 +138,7 @@ class Crawler:
 
         return link
 
+    # returns the score for the URL based upon importance and novelty factors
     def calculateScore(self, url):
         noveltyScore = 100
         importanceScore = 0
@@ -126,8 +157,9 @@ class Crawler:
 
         return 0.5 * noveltyScore + importanceScore
 
+    # checks if the URL is safe to parse the page based on robots.txt
     def checkRobotsSafe(self, url):
-        print("checkRobotsSafe called===================")
+        print("robot safe api called")
         start = datetime.now()
         robotParser = robotparser.RobotFileParser()
         if url in self.robotAllowed:
@@ -141,7 +173,7 @@ class Crawler:
         robotParser.read()
         isAllowed = robotParser.can_fetch("*", url)
         self.robotAllowed[url] = isAllowed
-        print("checkRobotSafe Total Time =============================",
+        print("checkRobotSafe Total Time =",
               datetime.now() - start)
         return isAllowed
 
@@ -149,12 +181,14 @@ class Crawler:
         try:
             while not self.priorityQueue.empty():
                 self.lock.acquire()
-                if log.totalLogWrites >= self.maxLinks + 10:
+                maximumUrls = self.maxUrls
+                if log.totalLogWrites >= self.maxUrls + 10:
                     self.lock.release()
                     break
 
                 url = ""
                 count = 0
+                # find the most relevant URL based on importance and novelty score
                 while True:
                     score, (newUrl, timeStamp,
                             depth, robotAllowed) = self.priorityQueue.get_nowait()
@@ -163,16 +197,25 @@ class Crawler:
                     parsedUrl = urlparse(newUrl)
                     domain = parsedUrl.netloc
                     baseUrl = parsedUrl.scheme + '://' + domain
+
+                    # visitedDomainsNoveltyScore stores updated timestamp for each domain.
+                    # if the timestamp of current URL is greater than the domain timestamp then
+                    # it means that the novelty score is not updated after the URL is added into the
+                    # priority queue and it is safe to assume that the URL is highly relevant.
+                    # The other case is if the priority queue url timestamp is less than domain timestamp for
+                    # novelty score then the url is added back to the priority queue with the updated novelty
+                    # score. If next time same url occurs in the priority queue then it is safe to assume that
+                    # the url is highly relevant.
                     if newUrl == url or timeStamp >= self.visitedDomainsNoveltyScore[domain][1]:
                         break
 
-                    print("count =============", count)
-
+                    # add url back to priority queue with updated score
                     del self.visitedUrlMap[newUrl]
                     self.addUrlsToCrawl(
                         [(newUrl, robotAllowed)], False, depth, log)
                     url = newUrl
-
+                print(
+                    "no of times the priority queue updated for highly relevant URL =", count)
                 self.lock.release()
                 try:
                     page = urlopen(newUrl, timeout=4)
@@ -187,55 +230,59 @@ class Crawler:
 
                     row = [newUrl, pageSize, depth, score*-1, statusCode, datetime.now().strftime(
                         "%d-%m-%Y %H:%M:%S"), robotAllowed, threading.currentThread().getName()]
-                    log.writeLog(row, self.maxLinks + 10)
+                    log.writeLog(row, self.maxUrls + 10)
 
                     if mimeType != 'text' or statusCode != 200:
                         continue
 
                 except HTTPError as e:
-                    print("Exception occured during opening a page =", e)
-                    print("url after exception ===", newUrl)
-
+                    print("Exception occured during opening a page ",
+                          newUrl, " = ", e)
                     statusCode = e.code
-                    print(" statusCode  after exception ===",  statusCode)
                     row = [newUrl, 0, depth, score*-1, statusCode, datetime.now().strftime(
                         "%d-%m-%Y %H:%M:%S"), robotAllowed, threading.currentThread().getName()]
-                    log.writeLog(row, self.maxLinks + 10)
+                    log.writeLog(row, self.maxUrls + 10)
                     continue
                 except URLError as e:
-                    print("URL ERROR OCCURRED ========")
+                    print("URL ERROR OCCURRED =", e)
                     row = [newUrl, 0, depth, score*-1, -1, datetime.now().strftime(
                         "%d-%m-%Y %H:%M:%S"), robotAllowed, threading.currentThread().getName()]
-                    log.writeLog(row, self.maxLinks + 10)
+                    log.writeLog(row, self.maxUrls + 10)
                     continue
                 except Exception as e:
-                    print("Exception OCCURRED ========")
+                    print("Exception OCCURRED = ", e)
                     row = [newUrl, 0, depth, score*-1, -1, datetime.now().strftime(
                         "%d-%m-%Y %H:%M:%S"), robotAllowed, threading.currentThread().getName()]
-                    log.writeLog(row, self.maxLinks + 10)
+                    log.writeLog(row, self.maxUrls + 10)
                     continue
 
                 self.lock.acquire()
-                if self.totalUrls >= 990 or not robotAllowed:
-                    print("self.totalUrls ===============", self.totalUrls)
+                # don't add more URLs if the priority queue has maxUrls
+                if self.totalUrls >= maximumUrls or not robotAllowed:
+                    print("totalUrls added in priority queue =", self.totalUrls,
+                          " robot allowed to fetch url ", newUrl, " = ", robotAllowed)
                     self.lock.release()
                     continue
                 self.lock.release()
 
+                # parse the page to find more URLs
                 soup = BeautifulSoup(htmlContent, 'html.parser')
                 newUrls = []
                 anchorTags = soup("a")
-                print("anchorTags =====", len(anchorTags))
+                print("total anchorTags in url ",
+                      newUrl, " = ", len(anchorTags))
                 for a in anchorTags:
                     self.lock.acquire()
-                    if self.totalUrlsParsed >= 990:
+                    # don't add more URLs in priority queue if the number of URLs added or about to add in the
+                    # priority queue by different threads reaches maxUrls.
+                    if self.totalUrlsParsed >= maximumUrls:
                         self.lock.release()
                         break
                     self.lock.release()
                     self.lock.acquire()
-                    if self.totalUrls >= 990 or not robotAllowed:
+                    if self.totalUrls >= maximumUrls or not robotAllowed:
                         print(
-                            "self.totalUrls after parsing ===============", self.totalUrls)
+                            "total URLs added to the priority queue = ", self.totalUrls)
                         self.lock.release()
                         break
                     self.lock.release()
@@ -247,13 +294,13 @@ class Crawler:
                                     (fullUrl, self.checkRobotsSafe(fullUrl)))
                                 self.lock.acquire()
                                 self.totalUrlsParsed += 1
-                                print("self.totalUrlsParsed ===========",
+                                print("total URLs parsed =",
                                       self.totalUrlsParsed)
                                 self.lock.release()
                     except:
                         continue
                 self.lock.acquire()
-                print("total urls to add ========", len(newUrls))
+                print("total urls to add =", len(newUrls))
                 self.addUrlsToCrawl(newUrls, True, depth + 1, log)
                 self.lock.release()
         except Exception as e:
@@ -262,15 +309,31 @@ class Crawler:
             return
 
 
+def checkRobotSafeForInitialSearchResults(crawler, url, robotSafeSearchResults):
+    isAllowed = crawler.checkRobotsSafe(url)
+    robotSafeSearchResults.append((url, isAllowed))
+
+
 if __name__ == '__main__':
-    searchResults = search("amazon web services", stop=10)
-    crawler = Crawler(990)
+    query = input("Enter Search query: ")
+    maxUrls = input("Enter max links: ")
+    searchResults = search(query, stop=10)
+    crawler = Crawler(int(maxUrls) - 10)
     log = Log()
+    robotSafeSearchResults = []
+    threads = []
 
-    searchResults = [(url, crawler.checkRobotsSafe(url))
-                     for url in searchResults]
+    for i, url in enumerate(searchResults):
+        thread = threading.Thread(
+            target=checkRobotSafeForInitialSearchResults, name="name"+str(i), args=(crawler, url, robotSafeSearchResults))
+        threads.append(thread)
+        thread.start()
 
-    crawler.addUrlsToCrawl(searchResults, False, 0, log)
+    # wait for all threads to finish
+    for thread in threads:
+        thread.join()
+
+    crawler.addUrlsToCrawl(robotSafeSearchResults, False, 0, log)
 
     threads = []
     start = datetime.now()
@@ -286,7 +349,7 @@ if __name__ == '__main__':
 
     print("total time =", datetime.now() - start)
     print("totalUrls =", crawler.totalUrls)
-    print("priorityQueue size =", crawler.priorityQueue.qsize())
-    print("totalLogWrites calls ===", log.totalLogWrites,
-          " self.totalLogsCalls ====", crawler.totalLogsCalls)
-    print("totalLogWritesErrors =====", log.totalLogWriteErrors)
+    print("total duplicated urls which are already visited = ",
+          crawler.totalDuplicatedUrls)
+    print("totalLogWrites calls =", log.totalLogWrites)
+    print("totalLogWritesErrors =", log.totalLogWriteErrors)
